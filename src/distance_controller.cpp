@@ -1,8 +1,10 @@
-#include "std_msgs/msg/float32_multi_array.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "rclcpp/duration.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/utilities.hpp"
+#include "rcpputils/scope_exit.hpp"
+#include "std_msgs/msg/float32_multi_array.hpp"
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <array>
@@ -29,20 +31,18 @@ constexpr float min_pos_error = 0.01f;
 
 class DistanceController : public rclcpp::Node {
 public:
-  DistanceController() : Node("distance_controller") {
+  DistanceController(int scene_number) : Node("distance_controller"), scene_number_(scene_number) {
     odom_subscriber_ = this->create_subscription<Odometry>("rosbot_xl_base_controller/odom", 10,
                                                            std::bind(&DistanceController::odom_callback, this, _1));
 
     cmd_vel_publisher_ = this->create_publisher<Twist>("/cmd_vel", 10);
     data_publisher_ = this->create_publisher<Float32MultiArray>("/distance_controller_data", 10);
 
-    trajectory_timer_ = this->create_wall_timer(10ms, std::bind(&DistanceController::execute_trajectory, this));
+    controller_timer_ = this->create_wall_timer(10ms, std::bind(&DistanceController::execute_trajectory, this));
 
     goal_pos_.setZero();
-    init_pos_.setZero();
     odom_pos_.setZero();
     odom_vel_.setZero();
-    odom_vel_prev_.setZero();
     error_.setZero();
     error_dot_.setZero();
     integral_.setZero();
@@ -52,74 +52,75 @@ public:
     Ki_ << ki, ki;
     Kd_ << kd, kd;
 
-    waypoints_b_ = {{{0.0f, 1.0f},
-                     {0.0f, -1.0f},
-                     {0.0f, -1.0f},
-                     {0.0f, 1.0f},
-                     {1.0f, 1.0f},
-                     {-1.0f, -1.0f},
-                     {1.0f, -1.0f},
-                     {-1.0f, 1.0f},
-                     {1.0f, 0.0f},
-                     {-1.0f, 0.0f}}};
-
-    // waypoints_b_ = {{{1.0f, 1.0f},
-    //                  {-1.0f, -1.0f},
-    //                  {1.0f, -1.0f},
-    //                  {-1.0f, 1.0f}}};
+    // Assigning waypoints based on scene number
+    switch (scene_number_) {
+    case 1: // Simulation
+      waypoints_ = {{0.0f, 1.0f},   {0.0f, -1.0f}, {0.0f, -1.0f}, {0.0f, 1.0f}, {1.0f, 1.0f},
+                    {-1.0f, -1.0f}, {1.0f, -1.0f}, {-1.0f, 1.0f}, {1.0f, 0.0f}, {-1.0f, 0.0f}};
+      break;
+    case 2: // CyberWorld
+      waypoints_ = {{0.92f, 0.0f}, {0.0f, -0.7f}, {0.0f, 0.7f}, {-0.92f, 0.0f}};
+      break;
+    default:
+      RCLCPP_ERROR(this->get_logger(), "Invalid Scene Number: %d", scene_number_);
+    }
 
     waypoint_idx_ = 0;
 
     cmd_vel_msg_ = Twist();
     data_msg_ = Float32MultiArray();
-    data_msg_.data.resize(5);
-
-    acc_norm_filtered_ = 0.0f;
+    data_msg_.data.resize(2);
   }
 
 private:
   rclcpp::Subscription<Odometry>::SharedPtr odom_subscriber_;
   rclcpp::Publisher<Twist>::SharedPtr cmd_vel_publisher_;
   rclcpp::Publisher<Float32MultiArray>::SharedPtr data_publisher_;
-  rclcpp::TimerBase::SharedPtr trajectory_timer_;
+  rclcpp::TimerBase::SharedPtr controller_timer_;
   rclcpp::Time last_time_, init_goal_time_;
-  Eigen::Vector2f goal_pos_, init_pos_, odom_pos_, odom_vel_, odom_vel_prev_;
+  Eigen::Vector2f goal_pos_, odom_pos_, odom_vel_;
   Eigen::Vector2f error_, error_dot_, integral_, twist_;
   Eigen::Vector2f Kp_, Ki_, Kd_;
-  std::array<Eigen::Vector2f, 10> waypoints_b_;
+  std::vector<Eigen::Vector2f> waypoints_;
   size_t waypoint_idx_;
   Twist cmd_vel_msg_;
   Float32MultiArray data_msg_;
-  float acc_norm_filtered_;
   bool have_time_ = false;
+  bool have_init_pos_ = false;
   bool goal_crossed_ = true;
   bool goal_finished_ = true;
+  int scene_number_;
 
   void odom_callback(const Odometry::SharedPtr msg) {
-    odom_pos_(0) = msg->pose.pose.position.x;
-    odom_pos_(1) = msg->pose.pose.position.y;
-    odom_vel_prev_ = odom_vel_;
-    odom_vel_(0) = msg->twist.twist.linear.x;
-    odom_vel_(1) = msg->twist.twist.linear.y;
+    odom_pos_(0) = static_cast<float>(msg->pose.pose.position.x);
+    odom_pos_(1) = static_cast<float>(msg->pose.pose.position.y);
+    odom_vel_(0) = static_cast<float>(msg->twist.twist.linear.x);
+    odom_vel_(1) = static_cast<float>(msg->twist.twist.linear.y);
+    if (!have_init_pos_) {
+      goal_pos_ = odom_pos_;
+      have_init_pos_ = true;
+    }
   }
 
   void execute_trajectory() {
+    if (!have_init_pos_)
+      return;
+
     if (goal_finished_) {
       goal_finished_ = false;
       rclcpp::sleep_for(2000ms);
 
-      if (waypoint_idx_ < waypoints_b_.size()) {
-        init_pos_ = goal_pos_;
-        goal_pos_ += waypoints_b_[waypoint_idx_];
+      if (waypoint_idx_ < waypoints_.size()) {
+        goal_pos_ += waypoints_[waypoint_idx_];
       } else {
         rclcpp::shutdown();
         return;
       }
 
-      waypoint_idx_++;
+      RCLCPP_INFO(this->get_logger(), "Strafing to waypoint %zu:\t(%.2f, %.2f)", waypoint_idx_ + 1,
+                  waypoints_[waypoint_idx_][0], waypoints_[waypoint_idx_][1]);
 
-      RCLCPP_INFO(this->get_logger(), "Strafing to waypoint %zu:\t(%.2f, %.2f)", waypoint_idx_,
-                  waypoints_b_[waypoint_idx_][0], waypoints_b_[waypoint_idx_][1]);
+      waypoint_idx_++;
     }
 
     // Time step
@@ -175,24 +176,21 @@ private:
     cmd_vel_msg_.linear.y = twist_(1);
     cmd_vel_publisher_->publish(cmd_vel_msg_);
 
-    // Approximate acceleration from odom twist measurements
-    float vel_norm = odom_vel_.norm();
-    float acc_norm = ((odom_vel_ - odom_vel_prev_) / dt).norm();
-    float alpha = 0.02f;
-    acc_norm_filtered_ = alpha * acc_norm + (1 - alpha) * acc_norm_filtered_;
-
     data_msg_.data[0] = error_norm;
-    data_msg_.data[1] = vel_norm;
-    data_msg_.data[2] = acc_norm_filtered_;
-    data_msg_.data[3] = integral_(0);
-    data_msg_.data[4] = integral_(1);
+    data_msg_.data[1] = odom_vel_.norm();
     data_publisher_->publish(data_msg_);
   }
 };
 
-int main(int argc, char *argv[]) {
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<DistanceController>());
+
+  int scene_number = 1;
+  if (argc > 1) {
+    scene_number = std::atoi(argv[1]);
+  }
+
+  rclcpp::spin(std::make_shared<DistanceController>(scene_number));
   rclcpp::shutdown();
   return 0;
 }
