@@ -26,7 +26,7 @@ constexpr float kd = 1.0f;
 constexpr float deriv_lpf_alpha = 0.2f;
 constexpr float integ_limit = 0.5f;
 
-constexpr float max_twist_magnitude = 0.9f;
+constexpr float max_twist_magnitude = 0.2f;
 constexpr float min_pos_error = 0.01f;
 
 class DistanceController : public rclcpp::Node {
@@ -35,7 +35,11 @@ public:
     odom_subscriber_ = this->create_subscription<Odometry>("rosbot_xl_base_controller/odom", 10,
                                                            std::bind(&DistanceController::odom_callback, this, _1));
 
-    cmd_vel_publisher_ = this->create_publisher<Twist>("/cmd_vel", 10);
+    rclcpp::QoS qos_profile(rclcpp::KeepLast(10));
+    qos_profile.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+    qos_profile.durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL);
+
+    cmd_vel_publisher_ = this->create_publisher<Twist>("/cmd_vel", qos_profile);
     data_publisher_ = this->create_publisher<Float32MultiArray>("/distance_controller_data", 10);
 
     controller_timer_ = this->create_wall_timer(10ms, std::bind(&DistanceController::execute_trajectory, this));
