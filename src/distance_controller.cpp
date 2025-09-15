@@ -44,6 +44,7 @@ public:
     error_dot_.setZero();
     integral_.setZero();
     twist_.setZero();
+    last_twist_.setZero();
 
     // Assigning waypoints based on scene number
     switch (scene_number_) {
@@ -53,6 +54,7 @@ public:
       kd_ = 0.7f;
       kp_ang_ = 0.0f;
       max_twist_mag_ = 0.9f;
+      max_accel_mag_ = 0.0f;
       waypoints_ = {{0.0f, 1.0f},   {0.0f, -1.0f}, {0.0f, -1.0f}, {0.0f, 1.0f}, {1.0f, 1.0f},
                     {-1.0f, -1.0f}, {1.0f, -1.0f}, {-1.0f, 1.0f}, {1.0f, 0.0f}, {-1.0f, 0.0f}};
       break;
@@ -60,8 +62,9 @@ public:
       kp_ = 3.0f;
       ki_ = 1.0f;
       kd_ = 0.5f;
-      kp_ang_ = 2.0f;
+      kp_ang_ = 4.0f;
       max_twist_mag_ = 0.3f;
+      max_accel_mag_ = 1.0f;
       waypoints_ = {{0.90f, 0.0f}, {0.0f, -0.5f}, {0.0f, 0.5f}, {-0.90f, 0.0f}};
       break;
     default:
@@ -76,7 +79,7 @@ public:
 
     cmd_vel_msg_ = Twist();
     data_msg_ = Float32MultiArray();
-    data_msg_.data.resize(5);
+    data_msg_.data.resize(6);
   }
 
 private:
@@ -86,10 +89,11 @@ private:
   rclcpp::TimerBase::SharedPtr controller_timer_;
   rclcpp::Time last_time_, init_goal_time_;
   Eigen::Vector2f goal_pos_, odom_pos_, odom_vel_;
-  Eigen::Vector2f error_, error_dot_, integral_, twist_;
+  Eigen::Vector2f error_, error_dot_, integral_, twist_, last_twist_;
   Eigen::Vector2f Kp_, Ki_, Kd_;
   Eigen::Matrix2f Rot_;
-  float kp_, ki_, kd_, kp_ang_, max_twist_mag_;
+  float kp_, ki_, kd_, kp_ang_;
+  float max_twist_mag_, max_accel_mag_;
   float odom_yaw_, odom_init_yaw_;
   std::vector<Eigen::Vector2f> waypoints_;
   size_t waypoint_idx_;
@@ -115,7 +119,8 @@ private:
       odom_init_yaw_ = odom_yaw_;
       Rot_ = Eigen::Rotation2D<float>(odom_init_yaw_).toRotationMatrix();
       have_init_pos_ = true;
-      RCLCPP_INFO(this->get_logger(), "Initial odom pos:\t\t(%.2f, %.2f), yaw: %.2f", odom_pos_(0), odom_pos_(1), odom_init_yaw_);
+      RCLCPP_INFO(this->get_logger(), "Initial odom pos:\t\t(%.2f, %.2f), yaw: %.2f", odom_pos_(0), odom_pos_(1),
+                  odom_init_yaw_);
     }
   }
 
@@ -189,6 +194,19 @@ private:
       goal_crossed_ = false;
     }
 
+    // Apply vector magnitude acceleration limit on twist
+    Eigen::Vector2f delta_twist = twist_ - last_twist_;
+    if (max_accel_mag_ > 0.0f) {
+      float max_delta_mag = max_accel_mag_ * dt;
+      float delta_mag = delta_twist.norm();
+
+      if (delta_mag > max_delta_mag)
+        delta_twist *= (max_delta_mag / delta_mag);
+
+      twist_ = last_twist_ + delta_twist;
+    }
+    last_twist_ = twist_;
+
     float yaw_error = odom_init_yaw_ - odom_yaw_;
 
     data_msg_.data[0] = error_norm;
@@ -196,6 +214,8 @@ private:
     data_msg_.data[2] = integral_.norm();
     data_msg_.data[3] = twist_.norm();
     data_msg_.data[4] = yaw_error;
+    if (dt > 1e-2f)
+      data_msg_.data[5] = delta_twist.norm() / dt;
     data_publisher_->publish(data_msg_);
 
     cmd_vel_msg_.linear.x = twist_(0);
